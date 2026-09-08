@@ -18,12 +18,12 @@ The Office 365 connection uses delegated authorization. Its sender is the mailbo
 
 ## Data flow
 
-1. The job queries Cost Management for the previous 30 days, grouped by resource ID.
+1. The job follows all Cost Management pages for the previous 30 complete UTC days, grouped by resource ID. The current partial day is excluded.
 2. Rows at or below USD 100 are discarded.
 3. For supported resource types, Azure Monitor metrics are queried for the same period.
-4. A resource is an idle candidate only when every required usage metric is available and all observed values are zero. Missing metrics, authorization failures, throttling, and unsupported types produce `Unknown`, never `Idle`.
+4. A resource is an idle candidate only when every required usage metric has valid daily data on all 30 days in every returned time series, and all observed values are zero. Missing or invalid evidence never proves idle; explicit nonzero evidence proves activity. Each metric has an explicit aggregation, including ADX `QueryResult` with `Count`.
 5. JSON, CSV, and HTML artifacts are written to Blob Storage.
-6. The HTML summary is posted to the Logic App, which emails `huliang@microsoft.com`.
+6. The HTML summary lists idle candidates and unknown resources over USD 100 in separate sections, omitting active resources. The Logic App emails `huliang@microsoft.com` and acknowledges the run only after its Outlook action succeeds.
 
 ## Safety
 
@@ -48,8 +48,10 @@ AKS, AML/Singularity, and unknown resource types are listed with cost but remain
 - Schedule: Mondays at 15:00 UTC.
 - Cost or authentication failure fails the job and prevents a misleading email.
 - Per-resource metric failures are captured in the report and classified `Unknown`.
-- Logic App or Blob failure fails the job so ACA records an unsuccessful execution.
-- API calls use bounded retries for throttling and transient service failures.
+- Logic App or Blob failure fails the job so ACA records an unsuccessful execution. HTTP 202 is not confirmation; HTTP 200 must acknowledge the same run ID after sending.
+- ARM calls retry throttling and transient transport/service failures with jitter and service-provided retry delays. Each cost page has a 20-minute retry budget; metric requests have three minutes, with at most 12 attempts per request.
+- ACA allows up to two replica retries and a two-hour replica timeout. A failed-execution metric alert emails the owner through an independent Azure Monitor action group. This does not detect a job that never starts.
+- Ambiguous notification timeouts can cause duplicate emails on ACA retries; exactly-once delivery is not guaranteed.
 
 ## Estimated cost
 
@@ -61,4 +63,6 @@ Expected recurring cost is approximately USD 6-10/month: Basic ACR about USD 5/m
 - A manual execution completes successfully.
 - Reports are present in Blob Storage.
 - An email from the authorized Outlook mailbox arrives at `huliang@microsoft.com`.
-- The report contains all Cost Management rows above USD 100 and never interprets unavailable evidence as zero usage.
+- JSON/CSV contain all resource-attributed Cost Management rows above USD 100 across all pages. HTML/email contain idle and unknown rows above that threshold.
+- Idle requires full 30/30 daily coverage; unavailable evidence is never interpreted as zero usage.
+- The Logic App returns a matching successful acknowledgement only after Outlook succeeds, and the failed-execution alert is enabled.

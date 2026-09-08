@@ -1,8 +1,9 @@
 param location string = resourceGroup().location
 param workflowName string
 param connectionName string = 'office365'
+param createConnection bool = true
 
-resource office365 'Microsoft.Web/connections@2016-06-01' = {
+resource office365 'Microsoft.Web/connections@2016-06-01' = if (createConnection) {
   name: connectionName
   location: location
   properties: {
@@ -19,15 +20,16 @@ resource workflow 'Microsoft.Logic/workflows@2019-05-01' = {
   identity: {
     type: 'SystemAssigned'
   }
+  dependsOn: [office365]
   properties: {
     state: 'Enabled'
     parameters: {
       '$connections': {
         value: {
           office365: {
-            connectionId: office365.id
-            connectionName: office365.name
-            id: office365.properties.api.id
+            connectionId: resourceId('Microsoft.Web/connections', connectionName)
+            connectionName: connectionName
+            id: subscriptionResourceId('Microsoft.Web/locations/managedApis', location, 'office365')
           }
         }
       }
@@ -49,8 +51,10 @@ resource workflow 'Microsoft.Logic/workflows@2019-05-01' = {
             schema: {
               type: 'object'
               required: [
+                'to'
                 'subject'
                 'html'
+                'runId'
               ]
               properties: {
                 to: { type: 'string' }
@@ -82,6 +86,34 @@ resource workflow 'Microsoft.Logic/workflows@2019-05-01' = {
             }
           }
         }
+        confirm_sent: {
+          type: 'Response'
+          kind: 'Http'
+          runAfter: {
+            send_email: ['Succeeded']
+          }
+          inputs: {
+            statusCode: 200
+            body: {
+              status: 'Sent'
+              runId: '@triggerBody()?[\'runId\']'
+            }
+          }
+        }
+        report_failure: {
+          type: 'Response'
+          kind: 'Http'
+          runAfter: {
+            send_email: ['Failed', 'TimedOut', 'Skipped']
+          }
+          inputs: {
+            statusCode: 502
+            body: {
+              status: 'Failed'
+              runId: '@triggerBody()?[\'runId\']'
+            }
+          }
+        }
       }
       outputs: {}
     }
@@ -89,4 +121,4 @@ resource workflow 'Microsoft.Logic/workflows@2019-05-01' = {
 }
 
 output workflowId string = workflow.id
-output connectionId string = office365.id
+output connectionId string = resourceId('Microsoft.Web/connections', connectionName)
