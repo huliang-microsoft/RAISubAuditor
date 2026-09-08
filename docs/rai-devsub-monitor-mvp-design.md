@@ -2,7 +2,7 @@
 
 ## Goal
 
-Run a weekly, read-only scan of subscription `c920e969-c175-44e3-a64b-d3009bafe279`. Report resources whose trailing 30-day cost exceeds USD 100 and classify supported resource types as active, idle candidates, or unknown. Email the report to `huliang@microsoft.com`.
+Run a weekly, read-only scan of subscription `c920e969-c175-44e3-a64b-d3009bafe279`. Report resources whose trailing 30-day cost exceeds USD 100 and classify supported resource types as active, idle candidates, or unknown. Email the report to `coreairaifte@microsoft.com`.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ The Office 365 connection uses delegated authorization. Its sender is the mailbo
 3. For supported resource types, Azure Monitor metrics are queried for the same period.
 4. A resource is an idle candidate only when every required usage metric has valid daily data on all 30 days in every returned time series, and all observed values are zero. Missing or invalid evidence never proves idle; explicit nonzero evidence proves activity. Each metric has an explicit aggregation, including ADX `QueryResult` with `Count`.
 5. JSON, CSV, and HTML artifacts are written to Blob Storage.
-6. The HTML summary lists idle candidates and unknown resources over USD 100 in separate sections, omitting active resources. The Logic App emails `huliang@microsoft.com` and acknowledges the run only after its Outlook action succeeds.
+6. The HTML summary lists idle candidates and unknown resources over USD 100 in separate sections, omitting active resources. The Logic App emails `coreairaifte@microsoft.com` and acknowledges the run only after its Outlook action succeeds.
 
 ## Safety
 
@@ -62,7 +62,7 @@ Expected recurring cost is approximately USD 6-10/month: Basic ACR about USD 5/m
 - Infrastructure deploys into `rai-devsub-monitor-rg`.
 - A manual execution completes successfully.
 - Reports are present in Blob Storage.
-- An email from the authorized Outlook mailbox arrives at `huliang@microsoft.com`.
+- An email from the authorized Outlook mailbox arrives at `coreairaifte@microsoft.com`.
 - JSON/CSV contain all resource-attributed Cost Management rows above USD 100 across all pages. HTML/email contain idle and unknown rows above that threshold.
 - Idle requires full 30/30 daily coverage; unavailable evidence is never interpreted as zero usage.
 - The Logic App returns a matching successful acknowledgement only after Outlook succeeds, and the failed-execution alert is enabled.

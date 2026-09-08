@@ -13,7 +13,7 @@ Weekly, read-only cost and idle-resource monitor for the OpenAI RAI Dev subscrip
 | Schedule | Mondays at 15:00 UTC (`0 15 * * 1`) |
 | Managed identity | `raiglobaldev/raiuai` |
 | Managed identity client ID | `309f79d6-3efe-447f-823e-eaf5ad13431c` |
-| Recipient | `huliang@microsoft.com` |
+| Recipient | `coreairaifte@microsoft.com` |
 | Cost threshold | More than USD 100 over the previous 30 complete UTC days |
 | Estimated platform cost | Approximately USD 6-10/month |
 
@@ -66,7 +66,7 @@ Other resource types remain `Unknown` and are included in email when cost exceed
 - Office 365 Outlook API connection authorized as `huliang@microsoft.com`
 - Azure Monitor metric alert for failed job executions and an independent email action group
 
-The Logic App callback is stored as an ACA secret. Reports use Entra ID authentication; no Storage account key is used.
+The Logic App callback is stored as an ACA secret. Reports use Entra ID authentication; no Storage account key is used. Weekly reports and failure alerts go to `coreairaifte@microsoft.com`; the existing Outlook sender authorization remains unchanged.
 
 ## Files
 

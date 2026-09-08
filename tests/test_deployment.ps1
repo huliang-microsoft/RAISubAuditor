@@ -35,6 +35,10 @@ Assert-True ($group.properties.emailReceivers.Count -eq 1) 'Failure alert needs 
 
 $tokens = $null
 $parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'deploy.ps1'), [ref]$tokens, [ref]$parseErrors) | Out-Null
+$deployment = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'deploy.ps1'), [ref]$tokens, [ref]$parseErrors)
 Assert-True ($parseErrors.Count -eq 0) 'Deployment PowerShell syntax must be valid'
-Write-Output 'Deployment checks passed: Logic App confirmation, failure alert and PowerShell syntax.'
+$recipient = $deployment.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Recipient' }
+Assert-True ($recipient.DefaultValue.SafeGetValue() -ceq 'coreairaifte@microsoft.com') 'Default report and alert recipient must be the team mailbox'
+Assert-True ($actions.send_email.inputs.body.To -eq '@triggerBody()?[''to'']') 'Report email must use the configured recipient'
+Assert-True ($group.properties.emailReceivers[0].emailAddress -eq '[parameters(''recipient'')]') 'Failure alert must use the configured recipient'
+Write-Output 'Deployment checks passed: team recipient, Logic App confirmation, failure alert and PowerShell syntax.'

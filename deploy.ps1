@@ -3,7 +3,7 @@ param(
     [string]$SubscriptionId = 'c920e969-c175-44e3-a64b-d3009bafe279',
     [string]$ResourceGroup = 'rai-devsub-monitor-rg',
     [string]$Location = 'eastus2',
-    [string]$Recipient = 'huliang@microsoft.com',
+    [string]$Recipient = 'coreairaifte@microsoft.com',
     [ValidatePattern('^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$')]
     [string]$ImageTag = (Get-Date -AsUTC -Format 'yyyyMMddTHHmmssZ'),
     [switch]$UpdateOnly
