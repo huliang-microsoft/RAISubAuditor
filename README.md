@@ -38,7 +38,7 @@ JSON and CSV retain all classifications for audit and troubleshooting. Unknown r
 - `Active`: at least one required metric has nonzero activity.
 - `Unknown`: the resource type is unsupported, required evidence is missing/incomplete/invalid, or the metric request fails, with no sufficient evidence of activity.
 
-Each metric uses its explicit aggregation, never a fallback to sampling count. Evidence includes daily coverage and aggregation. Daily coverage verifies available daily buckets, not continuous raw telemetry within each day. A resource retaining data or serving as a standby may still need to be kept even when traffic is zero.
+Each metric uses its explicit aggregation, never a fallback to sampling count. Evidence includes interval, daily coverage and aggregation. ACI does not support a daily time grain, so it uses hourly data and requires all 24 hourly buckets to count a day as covered. Other rules use daily buckets. Coverage verifies the returned buckets, not continuous raw telemetry within each bucket. A resource retaining data or serving as a standby may still need to be kept even when traffic is zero.
 
 `Unknown` is never converted to idle. The monitor does not stop, scale, delete, or otherwise modify business resources. An idle candidate is a review recommendation, not deletion approval.
 

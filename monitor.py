@@ -29,6 +29,7 @@ class MetricRule:
     label: str
     aliases: tuple[tuple[str, ...], ...]
     aggregations: tuple[str, ...] = ()
+    interval: str = "P1D"
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class MetricEvidence:
     covered_days: int
     expected_days: int
     aggregation: str
+    interval: str = "P1D"
 
 
 @dataclass
@@ -79,6 +81,7 @@ RULES: dict[str, MetricRule] = {
         "ACI compute/network",
         (("CpuUsage",), ("NetworkBytesReceivedPerSecond",), ("NetworkBytesTransmittedPerSecond",)),
         ("Average", "Average", "Average"),
+        "PT1H",
     ),
 }
 
@@ -209,19 +212,23 @@ def resolve_metrics(definitions: dict[str, str], rule: MetricRule) -> list[str] 
 def metric_totals(
     client: ArmClient, resource_id: str, metrics: list[str], start: datetime, end: datetime,
     aggregations: dict[str, str] | None = None,
+    interval: str = "P1D",
 ) -> dict[str, MetricEvidence]:
     start = start.astimezone(timezone.utc)
     end = end.astimezone(timezone.utc)
     if end <= start or any(value.time() != datetime.min.time() for value in (start, end)):
         raise ValueError("Metrics require a nonempty window of complete UTC days")
     expected_days = {start + timedelta(days=offset) for offset in range((end - start).days)}
+    step = {"P1D": timedelta(days=1), "PT1H": timedelta(hours=1)}[interval]
+    points_per_day = timedelta(days=1) // step
+    expected_points = {day + step * offset for day in expected_days for offset in range(points_per_day)}
     path = quote(resource_id, safe="/")
     start_utc = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_utc = end.strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {
         "api-version": "2018-01-01",
         "timespan": f"{start_utc}/{end_utc}",
-        "interval": "P1D",
+        "interval": interval,
         "autoAdjustTimegrain": "false",
         "validateDimensions": "false",
     }
@@ -235,8 +242,8 @@ def metric_totals(
             "GET", f"{ARM}{path}/providers/microsoft.insights/metrics",
             params={**params, "metricnames": ",".join(names), "aggregation": aggregation},
         ).json()
-        if response.get("interval") != "P1D":
-            raise ValueError("Metrics did not return the requested daily interval")
+        if response.get("interval") != interval:
+            raise ValueError("Metrics did not return the requested interval")
         for metric in response.get("value", []):
             name = metric.get("name", {}).get("value")
             if name not in names or metric.get("errorCode", "Success") != "Success":
@@ -250,7 +257,7 @@ def metric_totals(
                     if value is None:
                         continue
                     timestamp = datetime.fromisoformat(point["timeStamp"])
-                    if timestamp.utcoffset() is None or timestamp not in expected_days:
+                    if timestamp.utcoffset() is None or timestamp not in expected_points:
                         continue
                     numeric = float(value)
                     if not math.isfinite(numeric):
@@ -258,8 +265,12 @@ def metric_totals(
                     observed += abs(numeric)
                     covered.add(timestamp)
                 series_coverage.append(covered)
-            covered_days = len(set.intersection(*series_coverage)) if series_coverage else 0
-            totals[name] = MetricEvidence(observed, covered_days, len(expected_days), aggregation)
+            common_points = set.intersection(*series_coverage) if series_coverage else set()
+            covered_days = sum(
+                all(day + step * offset in common_points for offset in range(points_per_day))
+                for day in expected_days
+            )
+            totals[name] = MetricEvidence(observed, covered_days, len(expected_days), aggregation, interval)
     return totals
 
 
@@ -272,10 +283,10 @@ def classify(client: ArmClient, resource_id: str, resource_type: str, start: dat
         if not selected:
             return "Unknown", f"Required {rule.label} metrics are not all exposed"
         aggregations = dict(zip(selected, rule.aggregations or ("Total",) * len(selected), strict=True))
-        totals = metric_totals(client, resource_id, selected, start, end, aggregations)
+        totals = metric_totals(client, resource_id, selected, start, end, aggregations, rule.interval)
         missing = [name for name in selected if name not in totals]
         evidence = "; ".join(
-            f"{name}: sum(daily {item.aggregation})={item.total:.3f}, coverage={item.covered_days}/{item.expected_days} days"
+            f"{name}: sum({item.interval} {item.aggregation})={item.total:.3f}, coverage={item.covered_days}/{item.expected_days} days"
             for name, item in totals.items()
         )
         if missing:

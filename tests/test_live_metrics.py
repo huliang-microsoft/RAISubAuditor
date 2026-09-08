@@ -24,6 +24,7 @@ def live_context():
 
 @pytest.mark.parametrize("resource_type", [
     "microsoft.eventhub/namespaces", "microsoft.kusto/clusters", "microsoft.search/searchservices",
+    "microsoft.containerinstance/containergroups", "microsoft.containerregistry/registries",
 ])
 def test_live_metric_names_aggregations_and_daily_interval(live_context, resource_type):
     client, findings = live_context
@@ -33,7 +34,7 @@ def test_live_metric_names_aggregations_and_daily_interval(live_context, resourc
     assert selected, f"Required metrics are not exposed for {resource_type}"
     aggregations = dict(zip(selected, rule.aggregations or ("Total",) * len(selected), strict=True))
     end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    totals = metric_totals(client, resource["resource_id"], selected, end - timedelta(days=30), end, aggregations)
+    totals = metric_totals(client, resource["resource_id"], selected, end - timedelta(days=30), end, aggregations, rule.interval)
     assert set(totals) == set(selected)
     for item in totals.values():
         assert item.expected_days == 30

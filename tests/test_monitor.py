@@ -211,6 +211,23 @@ def test_adx_uses_query_result_count_and_ingestion_total() -> None:
     assert ingestion_call.kwargs["params"]["aggregation"] == "Total"
 
 
+@pytest.mark.parametrize("missing_hour", [False, True])
+def test_aci_requires_all_hours_for_daily_coverage(missing_hour) -> None:
+    resource_type = "microsoft.containerinstance/containergroups"
+    metrics = [{
+        "name": {"value": aliases[0]},
+        "timeseries": [{"data": [
+            {"timeStamp": (START + timedelta(hours=offset)).isoformat(), "average": 0}
+            for offset in range(30 * 24) if not (missing_hour and offset == 5)
+        ]}],
+    } for aliases in RULES[resource_type].aliases]
+    client = classification_client(metrics, resource_type, interval="PT1H")
+    classification, evidence = classify(client, "/resource", resource_type, START, END)
+    assert classification == ("Unknown" if missing_hour else "Idle candidate")
+    assert f"coverage={29 if missing_hour else 30}/30 days" in evidence
+    assert client.request.call_args.kwargs["params"]["interval"] == "PT1H"
+
+
 def test_failed_metric_is_unknown() -> None:
     metrics = daily_metrics()
     metrics[0]["errorCode"] = "InvalidSamplingType"
