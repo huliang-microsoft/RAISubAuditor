@@ -30,6 +30,7 @@ class MetricRule:
     aliases: tuple[tuple[str, ...], ...]
     aggregations: tuple[str, ...] = ()
     interval: str = "P1D"
+    activity_kind: str = "Data-plane activity"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,26 @@ class MetricEvidence:
     expected_days: int
     aggregation: str
     interval: str = "P1D"
+    last_nonzero_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ActivityObservation:
+    last_observed_at: str = "Unavailable"
+    signal: str = "Unavailable"
+    evidence: str = "No resource-specific usage rule"
+    covered_days: int = 0
+    expected_days: int = 0
+
+
+@dataclass(frozen=True)
+class Assessment:
+    classification: str
+    evidence: str
+    idle_likelihood: str
+    likelihood_basis: str
+    activity: ActivityObservation | None = None
+    metrics: tuple[str, ...] = ()
 
 
 @dataclass
@@ -51,6 +72,11 @@ class Finding:
     currency: str
     classification: str
     evidence: str
+    idle_likelihood: str = "Not assessed"
+    likelihood_basis: str = ""
+    last_observed_activity_at: str = "Unavailable"
+    activity_signal: str = "Unavailable"
+    activity_observation: str = "No resource-specific usage rule"
 
 
 RULES: dict[str, MetricRule] = {
@@ -62,6 +88,7 @@ RULES: dict[str, MetricRule] = {
         "VM compute/network",
         (("Percentage CPU", "PercentageCPU"), ("Network In Total", "NetworkInTotal"), ("Network Out Total", "NetworkOutTotal")),
         ("Average", "Total", "Total"),
+        activity_kind="Workload activity proxy",
     ),
     "microsoft.containerregistry/registries": MetricRule(
         "ACR push/pull",
@@ -82,6 +109,84 @@ RULES: dict[str, MetricRule] = {
         (("CpuUsage",), ("NetworkBytesReceivedPerSecond",), ("NetworkBytesTransmittedPerSecond",)),
         ("Average", "Average", "Average"),
         "PT1H",
+        "Workload activity proxy",
+    ),
+}
+
+
+ACTIVITY_RULES: dict[str, MetricRule] = {
+    "microsoft.cache/redis": MetricRule(
+        "Redis commands",
+        (("alltotalcommandsprocessed", "totalcommandsprocessed"),),
+        ("Total",),
+    ),
+    "microsoft.cdn/profiles": MetricRule(
+        "CDN requests",
+        (("RequestCount",),),
+        ("Total",),
+    ),
+    "microsoft.cognitiveservices/accounts": MetricRule(
+        "Cognitive Services calls",
+        (("TotalCalls", "TotalTransactions", "SuccessfulCalls"),),
+        ("Total",),
+    ),
+    "microsoft.compute/virtualmachinescalesets": MetricRule(
+        "VMSS compute/network",
+        (
+            ("Percentage CPU", "PercentageCPU"),
+            ("Network In Total", "Network In"),
+            ("Network Out Total", "Network Out"),
+        ),
+        ("Average", "Total", "Total"),
+        activity_kind="Workload activity proxy",
+    ),
+    "microsoft.dashboard/grafana": MetricRule(
+        "Grafana HTTP requests",
+        (("HttpRequestCount",),),
+        ("Count",),
+    ),
+    "microsoft.datafactory/factories": MetricRule(
+        "Data Factory pipeline runs",
+        (("PipelineSucceededRuns",), ("PipelineFailedRuns",), ("PipelineCancelledRuns",)),
+        ("Total", "Total", "Total"),
+        activity_kind="Pipeline workload activity",
+    ),
+    "microsoft.documentdb/databaseaccounts": MetricRule(
+        "Cosmos DB requests",
+        (("TotalRequests", "TotalRequestsPreview"),),
+        ("Count",),
+    ),
+    "microsoft.keyvault/managedhsms": MetricRule(
+        "Managed HSM API calls",
+        (("ServiceApiHit",),),
+        ("Count",),
+    ),
+    "microsoft.machinelearningservices/workspaces": MetricRule(
+        "Azure Machine Learning runs",
+        (("Runs",),),
+        ("Total",),
+        activity_kind="Workspace workload activity",
+    ),
+    "microsoft.network/azurefirewalls": MetricRule(
+        "Azure Firewall data processed",
+        (("DataProcessed",),),
+        ("Total",),
+    ),
+    "microsoft.servicebus/namespaces": MetricRule(
+        "Service Bus messages",
+        (("IncomingMessages",), ("OutgoingMessages",)),
+        ("Total", "Total"),
+    ),
+    "microsoft.storage/storageaccounts": MetricRule(
+        "Storage transactions",
+        (("Transactions",),),
+        ("Total",),
+    ),
+    "microsoft.web/serverfarms": MetricRule(
+        "App Service plan network",
+        (("BytesReceived",), ("BytesSent",)),
+        ("Total", "Total"),
+        activity_kind="Workload activity proxy",
     ),
 }
 
@@ -249,6 +354,7 @@ def metric_totals(
             if name not in names or metric.get("errorCode", "Success") != "Success":
                 continue
             observed = 0.0
+            last_nonzero_at: datetime | None = None
             series_coverage: list[set[datetime]] = []
             for series in metric.get("timeseries", []):
                 covered: set[datetime] = set()
@@ -263,6 +369,8 @@ def metric_totals(
                     if not math.isfinite(numeric):
                         raise ValueError(f"Non-finite metric value for {name}")
                     observed += abs(numeric)
+                    if numeric != 0 and (last_nonzero_at is None or timestamp > last_nonzero_at):
+                        last_nonzero_at = timestamp
                     covered.add(timestamp)
                 series_coverage.append(covered)
             common_points = set.intersection(*series_coverage) if series_coverage else set()
@@ -270,20 +378,78 @@ def metric_totals(
                 all(day + step * offset in common_points for offset in range(points_per_day))
                 for day in expected_days
             )
-            totals[name] = MetricEvidence(observed, covered_days, len(expected_days), aggregation, interval)
+            totals[name] = MetricEvidence(
+                observed, covered_days, len(expected_days), aggregation, interval, last_nonzero_at
+            )
     return totals
 
 
-def classify(client: ArmClient, resource_id: str, resource_type: str, start: datetime, end: datetime) -> tuple[str, str]:
+def summarize_activity(
+    rule: MetricRule, metrics: tuple[str, ...], totals: dict[str, MetricEvidence], expected_days: int
+) -> ActivityObservation:
+    missing = [name for name in metrics if name not in totals]
+    covered_days = min((totals[name].covered_days if name in totals else 0 for name in metrics), default=0)
+    last_nonzero_at = max(
+        (item.last_nonzero_at for item in totals.values() if item.last_nonzero_at is not None),
+        default=None,
+    )
+    precision = "hour" if rule.interval == "PT1H" else "day"
+    signal = f"{rule.activity_kind} via Azure Monitor metrics: {', '.join(metrics)}"
+    coverage = f"minimum daily coverage={covered_days}/{expected_days} days"
+    if last_nonzero_at is not None:
+        timestamp = last_nonzero_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return ActivityObservation(
+            timestamp,
+            signal,
+            f"Latest observed nonzero {precision} bucket in the {expected_days}-day window; {coverage}",
+            covered_days,
+            expected_days,
+        )
+    if not missing and covered_days == expected_days:
+        return ActivityObservation(
+            f"Not observed in last {expected_days} days",
+            signal,
+            f"No nonzero {precision} bucket observed in {expected_days} complete days; full daily coverage",
+            covered_days,
+            expected_days,
+        )
+    return ActivityObservation(
+        "Unavailable",
+        signal,
+        f"No nonzero bucket observed, but {coverage}; missing evidence cannot prove inactivity",
+        covered_days,
+        expected_days,
+    )
+
+
+def assess(client: ArmClient, resource_id: str, resource_type: str, start: datetime, end: datetime) -> Assessment:
     rule = RULES.get(resource_type.casefold())
     if not rule:
-        return "Unknown", "No resource-specific idle rule in MVP"
+        return Assessment(
+            "Unknown",
+            "No resource-specific idle rule in MVP",
+            "Not assessed",
+            "No resource-specific usage evidence is available",
+            ActivityObservation(),
+        )
     try:
         selected = resolve_metrics(metric_definitions(client, resource_id), rule)
         if not selected:
-            return "Unknown", f"Required {rule.label} metrics are not all exposed"
+            return Assessment(
+                "Unknown",
+                f"Required {rule.label} metrics are not all exposed",
+                "Not assessed",
+                "Required usage evidence is unavailable",
+                ActivityObservation(
+                    "Unavailable",
+                    f"{rule.activity_kind}: {rule.label}",
+                    "Required activity metrics are not all exposed",
+                ),
+            )
         aggregations = dict(zip(selected, rule.aggregations or ("Total",) * len(selected), strict=True))
         totals = metric_totals(client, resource_id, selected, start, end, aggregations, rule.interval)
+        metrics = tuple(selected)
+        activity = summarize_activity(rule, metrics, totals, (end - start).days)
         missing = [name for name in selected if name not in totals]
         evidence = "; ".join(
             f"{name}: sum({item.interval} {item.aggregation})={item.total:.3f}, coverage={item.covered_days}/{item.expected_days} days"
@@ -292,13 +458,165 @@ def classify(client: ArmClient, resource_id: str, resource_type: str, start: dat
         if missing:
             evidence += "; Missing metrics: " + ", ".join(missing)
         if any(item.total > 0 for item in totals.values()):
-            return "Active", evidence
+            return Assessment(
+                "Active", evidence, "Low", "At least one required usage metric is nonzero", activity, metrics
+            )
         if missing or any(item.covered_days != item.expected_days for item in totals.values()):
-            return "Unknown", "Incomplete daily coverage. " + evidence
-        return "Idle candidate", evidence
+            coverage = min(
+                (
+                    totals[name].covered_days / totals[name].expected_days
+                    if name in totals and totals[name].expected_days else 0
+                )
+                for name in selected
+            )
+            if coverage >= 0.9:
+                likelihood = "High"
+            elif coverage >= 0.5:
+                likelihood = "Medium"
+            elif coverage > 0:
+                likelihood = "Low"
+            else:
+                likelihood = "Not assessed"
+            return Assessment(
+                "Unknown",
+                "Incomplete daily coverage. " + evidence,
+                likelihood,
+                f"Observed usage is zero with {coverage:.0%} minimum required-metric coverage; 100% is required for idle",
+                activity,
+                metrics,
+            )
+        return Assessment(
+            "Idle candidate",
+            evidence,
+            "High",
+            "All required usage metrics are zero with full coverage",
+            activity,
+            metrics,
+        )
     except Exception as exc:  # continue the report while preserving uncertainty
         LOG.warning("Metric classification failed for %s: %s", resource_id, exc)
-        return "Unknown", f"Metric query failed: {type(exc).__name__}: {exc}"
+        return Assessment(
+            "Unknown",
+            f"Metric query failed: {type(exc).__name__}: {exc}",
+            "Not assessed",
+            "Usage evidence could not be queried",
+            ActivityObservation("Unavailable", f"{rule.activity_kind}: {rule.label}", "Usage metrics could not be queried"),
+        )
+
+
+def classify(client: ArmClient, resource_id: str, resource_type: str, start: datetime, end: datetime) -> tuple[str, str]:
+    result = assess(client, resource_id, resource_type, start, end)
+    return result.classification, result.evidence
+
+
+def observe_activity_history(
+    client: ArmClient,
+    resource_id: str,
+    resource_type: str,
+    metrics: tuple[str, ...] | None,
+    end: datetime,
+    days: int = 90,
+) -> ActivityObservation:
+    rule = RULES.get(resource_type.casefold()) or ACTIVITY_RULES.get(resource_type.casefold())
+    if not rule:
+        return ActivityObservation()
+    start = end - timedelta(days=days)
+    try:
+        if metrics is None:
+            selected = resolve_metrics(metric_definitions(client, resource_id), rule)
+            if not selected:
+                return ActivityObservation(
+                    "Unavailable",
+                    f"{rule.activity_kind}: {rule.label}",
+                    "Required activity metrics are not all exposed",
+                    0,
+                    days,
+                )
+            metrics = tuple(selected)
+        if not metrics:
+            return ActivityObservation()
+        aggregations = dict(zip(metrics, rule.aggregations or ("Total",) * len(metrics), strict=True))
+        totals: dict[str, MetricEvidence] = {}
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + timedelta(days=30), end)
+            chunk = metric_totals(
+                client, resource_id, list(metrics), chunk_start, chunk_end, aggregations, rule.interval
+            )
+            for name, item in chunk.items():
+                previous = totals.get(name)
+                if previous is None:
+                    totals[name] = item
+                    continue
+                last_nonzero_at = max(
+                    (
+                        timestamp for timestamp in (previous.last_nonzero_at, item.last_nonzero_at)
+                        if timestamp is not None
+                    ),
+                    default=None,
+                )
+                totals[name] = MetricEvidence(
+                    previous.total + item.total,
+                    previous.covered_days + item.covered_days,
+                    previous.expected_days + item.expected_days,
+                    item.aggregation,
+                    item.interval,
+                    last_nonzero_at,
+                )
+            chunk_start = chunk_end
+        return summarize_activity(rule, metrics, totals, days)
+    except Exception as exc:
+        LOG.warning("Historical activity query failed for %s: %s", resource_id, exc)
+        return ActivityObservation(
+            "Unavailable",
+            f"{rule.activity_kind} via Azure Monitor metrics: {', '.join(metrics)}",
+            f"90-day activity history could not be queried ({type(exc).__name__})",
+            0,
+            days,
+        )
+
+
+def idle_likelihood_from_activity(activity: ActivityObservation, end: datetime) -> tuple[str, str]:
+    if (
+        activity.last_observed_at.startswith("Not observed")
+        and activity.expected_days > 0
+        and activity.covered_days == activity.expected_days
+    ):
+        return "High", f"No nonzero usage observed with complete {activity.expected_days}-day coverage"
+    try:
+        last_observed_at = datetime.fromisoformat(activity.last_observed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return "Not assessed", "No complete resource-specific activity evidence is available"
+    age_days = max(0, (end.astimezone(timezone.utc).date() - last_observed_at.date()).days)
+    if age_days <= 30:
+        return "Low", f"Nonzero usage was observed {age_days} days ago"
+    if activity.covered_days != activity.expected_days:
+        return "Medium", f"Last observed usage was {age_days} days ago, but history coverage is incomplete"
+    if age_days <= 60:
+        return "Medium", f"Last observed nonzero usage was {age_days} days ago"
+    return "High", f"Last observed nonzero usage was {age_days} days ago with complete history coverage"
+
+
+def enrich_activity_history(
+    client: ArmClient,
+    targets: list[tuple[Finding, tuple[str, ...] | None]],
+    end: datetime,
+    days: int = 90,
+) -> None:
+    if not targets:
+        return
+    LOG.info("Enriching %d non-active resources with %d-day usage history", len(targets), days)
+    for completed, (finding, metrics) in enumerate(targets, start=1):
+        activity = observe_activity_history(
+            client, finding.resource_id, finding.resource_type, metrics, end, days
+        )
+        finding.last_observed_activity_at = activity.last_observed_at
+        finding.activity_signal = activity.signal
+        finding.activity_observation = activity.evidence
+        if finding.classification == "Unknown":
+            finding.idle_likelihood, finding.likelihood_basis = idle_likelihood_from_activity(activity, end)
+        if completed % 10 == 0 or completed == len(targets):
+            LOG.info("Usage-history progress: %d/%d resources", completed, len(targets))
 
 
 def resource_name(resource_id: str) -> str:
@@ -320,22 +638,28 @@ def render_html(findings: list[Finding], start: datetime, end: datetime, thresho
     for title, items in (("Idle candidates", idle_findings), ("Unknown: review required", unknown_findings)):
         rows = "".join(
             "<tr>"
-            f"<td>{html.escape(item.classification)}</td><td>{html.escape(item.currency)} {item.cost:,.2f}</td>"
+            f"<td>{html.escape(item.classification)}</td><td>{html.escape(item.idle_likelihood)}</td>"
+            f"<td>{html.escape(item.currency)} {item.cost:,.2f}</td>"
             f'<td><a href="https://portal.azure.com/#resource{quote(item.resource_id, safe="/")}">{html.escape(item.resource_name)}</a></td>'
             f"<td>{html.escape(item.resource_type)}</td><td>{html.escape(item.resource_group)}</td>"
+            f"<td>{html.escape(item.last_observed_activity_at)}</td>"
+            f"<td>{html.escape(item.activity_signal)}</td>"
+            f"<td>{html.escape(item.activity_observation)}</td>"
+            f"<td>{html.escape(item.likelihood_basis)}</td>"
             f"<td>{html.escape(item.evidence)}</td></tr>"
             for item in sorted(items, key=lambda item: item.cost, reverse=True)
         )
         if not rows:
-            rows = '<tr><td colspan="6">None.</td></tr>'
+            rows = '<tr><td colspan="11">None.</td></tr>'
         sections.append(f"""<h3>{title}: {len(items)}</h3>
 <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
-<thead><tr><th>Status</th><th>30d cost</th><th>Resource</th><th>Type</th><th>Resource group</th><th>Evidence</th></tr></thead>
+<thead><tr><th>Status</th><th>Idle likelihood</th><th>30d cost</th><th>Resource</th><th>Type</th><th>Resource group</th><th>Last observed activity (UTC)</th><th>Activity signal</th><th>90d activity observation</th><th>Likelihood basis</th><th>30d usage evidence</th></tr></thead>
 <tbody>{rows}</tbody></table>""")
     return f"""<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif">
 <h2>RAI Dev subscription cost and idle-resource report</h2>
 <p>Window: {start.date()} (inclusive) to {end.date()} (exclusive), UTC. Threshold: &gt; USD {threshold:,.2f}.</p>
 <p><strong>Read-only advisory:</strong> Review dependencies, retained data and ownership before any action. Unknown means insufficient evidence, not idle or safe to delete. Active resources are omitted.</p>
+<p>Idle likelihood summarizes available usage evidence; <strong>Not assessed</strong> means there is no usable resource-specific evidence. Last observed activity is the latest nonzero Azure Monitor metric bucket in the stated window. Event Hubs, ACR, Search and ADX use data-plane signals; VM and ACI use workload proxies. "Not observed" is bounded by the 90-day window and requires full metric coverage.</p>
 {"".join(sections)}</body></html>"""
 
 
@@ -383,25 +707,35 @@ def main() -> None:
     client = ArmClient(credential)
     rows = cost_rows(client, subscription_id, start, end)
     findings: list[Finding] = []
+    history_targets: list[tuple[Finding, tuple[str, ...] | None]] = []
     candidates = [row for row in rows if float(row.get("Cost", 0) or 0) > threshold and str(row.get("ResourceId", "") or "").startswith("/subscriptions/")]
     LOG.info("Cost query returned %d rows; classifying %d resources above threshold", len(rows), len(candidates))
     for row in candidates:
         cost = float(row.get("Cost", 0) or 0)
         resource_id = str(row.get("ResourceId", "") or "")
         resource_type = str(row.get("ResourceType", "") or "")
-        classification, evidence = classify(client, resource_id, resource_type, start, end)
-        findings.append(
-            Finding(
-                resource_id=resource_id,
-                resource_group=str(row.get("ResourceGroupName", "") or ""),
-                resource_type=resource_type,
-                resource_name=resource_name(resource_id),
-                cost=cost,
-                currency=str(row.get("Currency", "USD") or "USD"),
-                classification=classification,
-                evidence=evidence,
-            )
+        assessment = assess(client, resource_id, resource_type, start, end)
+        activity = assessment.activity or ActivityObservation()
+        finding = Finding(
+            resource_id=resource_id,
+            resource_group=str(row.get("ResourceGroupName", "") or ""),
+            resource_type=resource_type,
+            resource_name=resource_name(resource_id),
+            cost=cost,
+            currency=str(row.get("Currency", "USD") or "USD"),
+            classification=assessment.classification,
+            evidence=assessment.evidence,
+            idle_likelihood=assessment.idle_likelihood,
+            likelihood_basis=assessment.likelihood_basis,
+            last_observed_activity_at=activity.last_observed_at,
+            activity_signal=activity.signal,
+            activity_observation=activity.evidence,
         )
+        findings.append(finding)
+        activity_rule = ACTIVITY_RULES.get(resource_type.casefold())
+        if assessment.classification != "Active" and (assessment.metrics or activity_rule):
+            history_targets.append((finding, assessment.metrics or None))
+    enrich_activity_history(client, history_targets, end)
     findings.sort(key=lambda item: item.cost, reverse=True)
 
     report_html = render_html(findings, start, end, threshold)

@@ -5,7 +5,11 @@ import pytest
 import requests
 import monitor
 
-from monitor import ArmClient, RULES, Finding, MetricRule, classify, cost_rows, metric_totals, render_html, resolve_metrics, retry_delay, send_report
+from monitor import (
+    ACTIVITY_RULES, ActivityObservation, ArmClient, RULES, Finding, MetricRule, assess, classify,
+    cost_rows, enrich_activity_history, idle_likelihood_from_activity, metric_totals,
+    observe_activity_history, render_html, resolve_metrics, retry_delay, send_report,
+)
 
 
 def test_cost_rows_reads_all_pages_with_each_pages_columns() -> None:
@@ -72,6 +76,23 @@ def test_html_escapes_resource_values() -> None:
     assert "&lt;unsafe&gt;" in value
     assert "missing &amp; unknown" in value
     assert "<unsafe>" not in value
+
+
+def test_html_includes_likelihood_and_metric_activity_context() -> None:
+    finding = Finding(
+        "/idle", "rg", "type", "resource", 123.0, "USD", "Idle candidate", "usage=0",
+        idle_likelihood="High", likelihood_basis="full coverage",
+        last_observed_activity_at="2026-09-01T00:00:00Z",
+        activity_signal="Data-plane activity via Azure Monitor metrics: Requests",
+        activity_observation="Latest observed nonzero day bucket in the 90-day window",
+    )
+    value = render_html([finding], START, END, 100)
+    assert "Idle likelihood" in value
+    assert "Last observed activity" in value
+    assert "2026-09-01T00:00:00Z" in value
+    assert "Data-plane activity" in value
+    assert "Creator alias" not in value
+    assert "control-plane" not in value
 
 
 def test_html_lists_idle_and_unknown_above_threshold() -> None:
@@ -155,6 +176,31 @@ def test_full_zero_coverage_is_idle() -> None:
     assert "coverage=30/30 days" in evidence
 
 
+@pytest.mark.parametrize("days,expected", [(27, "High"), (15, "Medium"), (1, "Low"), (0, "Not assessed")])
+def test_incomplete_zero_coverage_sets_evidence_based_likelihood(days, expected) -> None:
+    result = assess(classification_client(daily_metrics(days=days)), "/resource", EVENTHUB, START, END)
+    assert result.classification == "Unknown"
+    assert result.idle_likelihood == expected
+    assert f"{days / 30:.0%} minimum required-metric coverage" in result.likelihood_basis
+
+
+def test_unsupported_resource_likelihood_is_not_assessed() -> None:
+    result = assess(Mock(), "/resource", "unsupported/type", START, END)
+    assert result.classification == "Unknown"
+    assert result.idle_likelihood == "Not assessed"
+
+
+def test_activity_only_rules_cover_high_volume_unknown_types() -> None:
+    assert {
+        "microsoft.cache/redis",
+        "microsoft.machinelearningservices/workspaces",
+        "microsoft.documentdb/databaseaccounts",
+        "microsoft.storage/storageaccounts",
+        "microsoft.cognitiveservices/accounts",
+        "microsoft.servicebus/namespaces",
+    } <= ACTIVITY_RULES.keys()
+
+
 @pytest.mark.parametrize("days", [0, 1, 29])
 def test_partial_zero_coverage_is_unknown(days) -> None:
     result, evidence = classify(classification_client(daily_metrics(days=days)), "/resource", EVENTHUB, START, END)
@@ -232,6 +278,81 @@ def test_failed_metric_is_unknown() -> None:
     metrics = daily_metrics()
     metrics[0]["errorCode"] = "InvalidSamplingType"
     assert classify(classification_client(metrics), "/resource", EVENTHUB, START, END)[0] == "Unknown"
+
+
+def test_metric_totals_tracks_latest_nonzero_bucket() -> None:
+    metrics = daily_metrics()
+    metrics[0]["timeseries"][0]["data"][5]["total"] = 2
+    metrics[0]["timeseries"][0]["data"][20]["total"] = 3
+    totals = metric_totals(
+        classification_client(metrics), "/resource", ["IncomingMessages"], START, END
+    )
+    assert totals["IncomingMessages"].last_nonzero_at == START + timedelta(days=20)
+
+
+def history_metrics(days=90, active_day=None):
+    history_start = END - timedelta(days=days)
+    metrics = daily_metrics(days=0)
+    for metric in metrics:
+        aggregation = next(
+            aggregation for aliases, aggregation in zip(
+                RULES[EVENTHUB].aliases,
+                RULES[EVENTHUB].aggregations or ("Total",) * len(RULES[EVENTHUB].aliases),
+                strict=True,
+            ) if aliases[0] == metric["name"]["value"]
+        )
+        metric["timeseries"][0]["data"] = [
+            {
+                "timeStamp": (history_start + timedelta(days=offset)).isoformat(),
+                aggregation.lower(): 1 if active_day == offset else 0,
+            }
+            for offset in range(days)
+        ]
+    return metrics
+
+
+def test_historical_activity_finds_usage_before_idle_window() -> None:
+    metrics = history_metrics(active_day=10)
+    selected = tuple(group[0] for group in RULES[EVENTHUB].aliases)
+    client = classification_client(metrics)
+    result = observe_activity_history(client, "/resource", EVENTHUB, selected, END)
+    expected = END - timedelta(days=80)
+    assert result.last_observed_at == expected.isoformat().replace("+00:00", "Z")
+    assert "90-day window" in result.evidence
+    assert "Data-plane activity" in result.signal
+    assert client.request.call_count == 3
+
+
+def test_historical_activity_reports_complete_zero_window() -> None:
+    selected = tuple(group[0] for group in RULES[EVENTHUB].aliases)
+    client = classification_client(history_metrics())
+    result = observe_activity_history(client, "/resource", EVENTHUB, selected, END)
+    assert result.last_observed_at == "Not observed in last 90 days"
+    assert "full daily coverage" in result.evidence
+    assert client.request.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "activity,expected",
+    [
+        (ActivityObservation("Not observed in last 90 days", "signal", "evidence", 90, 90), "High"),
+        (ActivityObservation((END - timedelta(days=10)).isoformat(), "signal", "evidence", 90, 90), "Low"),
+        (ActivityObservation((END - timedelta(days=45)).isoformat(), "signal", "evidence", 90, 90), "Medium"),
+        (ActivityObservation((END - timedelta(days=70)).isoformat(), "signal", "evidence", 90, 90), "High"),
+        (ActivityObservation("Unavailable", "signal", "evidence", 0, 90), "Not assessed"),
+    ],
+)
+def test_unknown_likelihood_uses_activity_age_and_coverage(activity, expected) -> None:
+    assert idle_likelihood_from_activity(activity, END)[0] == expected
+
+
+def test_history_enrichment_sets_unknown_likelihood(monkeypatch) -> None:
+    finding = Finding("/unknown", "rg", "type", "unknown", 200, "USD", "Unknown", "unsupported")
+    activity = ActivityObservation("Not observed in last 90 days", "signal", "evidence", 90, 90)
+    monkeypatch.setattr("monitor.observe_activity_history", Mock(return_value=activity))
+    enrich_activity_history(Mock(), [(finding, None)], END)
+    assert finding.idle_likelihood == "High"
+    assert "complete 90-day coverage" in finding.likelihood_basis
 
 
 def test_retry_delay_honors_largest_cost_management_header(monkeypatch) -> None:
@@ -370,6 +491,7 @@ def configure_main(monkeypatch):
     send = Mock()
     monkeypatch.setattr("monitor.upload_reports", upload)
     monkeypatch.setattr("monitor.send_report", send)
+    monkeypatch.setattr("monitor.enrich_activity_history", Mock())
     return upload, send
 
 
@@ -389,6 +511,10 @@ def test_main_reports_high_cost_unknown_and_keeps_complete_day_window(monkeypatc
     artifacts = upload.call_args.args[-1]
     report = json.loads(artifacts["json"][0])
     assert report["findings"][0]["classification"] == "Unknown"
+    assert report["findings"][0]["idle_likelihood"] == "Not assessed"
+    assert report["findings"][0]["last_observed_activity_at"] == "Unavailable"
+    assert "creator_alias" not in report["findings"][0]
+    assert "last_user_alias" not in report["findings"][0]
     payload = send.call_args.args[1]
     assert "1 unknown" in payload["subject"]
     assert "Unknown: review required: 1" in payload["html"]

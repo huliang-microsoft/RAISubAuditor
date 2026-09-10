@@ -26,9 +26,10 @@ The implementation is a Python 3.12 container executed as an Azure Container App
 3. Resolve Azure Monitor metric definitions for supported resource types.
 4. Query required usage metrics over the same 30-day window.
 5. Classify a resource as `Idle candidate` only when every required metric has valid data on all 30 days in every returned time series, and all observations are zero.
-6. Store complete JSON/CSV findings and the HTML review summary in the private `reports` Blob container.
-7. Send an HTML email with separate **`Idle candidate` and `Unknown` sections**, both restricted to costs above USD 100. `Active` rows are omitted.
-8. Require a synchronous Logic App acknowledgement for this run, returned only after Outlook's send action succeeds.
+6. Enrich supported idle and unknown findings with the latest nonzero usage metric bucket over the previous 90 complete UTC days.
+7. Store complete JSON/CSV findings and the HTML review summary in the private `reports` Blob container.
+8. Send an HTML email with separate **`Idle candidate` and `Unknown` sections**, both restricted to costs above USD 100. `Active` rows are omitted.
+9. Require a synchronous Logic App acknowledgement for this run, returned only after Outlook's send action succeeds.
 
 JSON and CSV retain all classifications for audit and troubleshooting. Unknown resources appear in email with the reason they could not be classified; they are review items, not deletion recommendations. Resource names link to Azure Portal. The scan excludes the incomplete current UTC day, and the report labels the end date as exclusive.
 
@@ -41,6 +42,19 @@ JSON and CSV retain all classifications for audit and troubleshooting. Unknown r
 Each metric uses its explicit aggregation, never a fallback to sampling count. Evidence includes interval, daily coverage and aggregation. ACI does not support a daily time grain, so it uses hourly data and requires all 24 hourly buckets to count a day as covered. Other rules use daily buckets. Coverage verifies the returned buckets, not continuous raw telemetry within each bucket. A resource retaining data or serving as a standby may still need to be kept even when traffic is zero.
 
 `Unknown` is never converted to idle. The monitor does not stop, scale, delete, or otherwise modify business resources. An idle candidate is a review recommendation, not deletion approval.
+
+Idle likelihood describes the strength of available usage evidence: `High`, `Medium`, `Low`, or `Not assessed`. Full zero coverage produces `High`; partial zero coverage is graded by the minimum required-metric coverage; nonzero evidence produces `Low` and an `Active` classification. `Not assessed` means no usable resource-specific evidence exists and is not an idle signal.
+
+For resource types without a deletion-safe idle rule, activity-only rules keep the classification as `Unknown` but provide review priority from 90-day usage history:
+
+- `Low`: nonzero usage observed within the last 30 days.
+- `Medium`: last observed usage was 31-60 days ago, or older positive evidence has incomplete history coverage.
+- `High`: last observed usage was 61-90 days ago with complete coverage, or no nonzero usage was observed with complete 90-day coverage.
+- `Not assessed`: the activity metric is unavailable or coverage is insufficient.
+
+A likelihood is not deletion approval. Activity-only rules can miss service-specific dependencies or usage modes, so these resources remain `Unknown` even when likelihood is `High`.
+
+Last observed activity comes only from Azure Monitor usage metrics, not administrative activity. Event Hubs, ACR, Azure AI Search and ADX use data-plane traffic, push/pull, query, indexing or ingestion signals. VM and ACI CPU/network metrics are labeled as workload activity proxies because they do not identify an end-user request. The observation uses daily buckets, except ACI uses hourly buckets. `Not observed in last 90 days` means every required metric had complete coverage and no nonzero bucket in that bounded window; it never means the resource was never used. Unsupported types and incomplete evidence remain `Unavailable`.
 
 ## Supported MVP rules
 
@@ -55,6 +69,26 @@ Each metric uses its explicit aggregation, never a fallback to sampling count. E
 
 Other resource types remain `Unknown` and are included in email when cost exceeds the threshold.
 
+## Activity-only rules for Unknown resources
+
+| Resource type | Activity signal |
+|---|---|
+| Azure Cache for Redis | Commands processed |
+| CDN profile | Request count |
+| Cognitive Services account | Calls or transactions |
+| Virtual machine scale set | CPU and network workload proxy |
+| Managed Grafana | HTTP request count |
+| Data Factory | Pipeline run outcomes |
+| Cosmos DB account | Request count |
+| Managed HSM | Service API calls |
+| Azure Machine Learning workspace | Workspace runs |
+| Azure Firewall | Data processed |
+| Service Bus namespace | Incoming and outgoing messages |
+| Storage account | Transactions |
+| App Service plan | Network workload proxy |
+
+These rules provide likelihood and last-observed activity only. They do not convert an `Unknown` resource into an idle candidate.
+
 ## Azure resources
 
 - Azure Container Apps environment and scheduled job
@@ -66,7 +100,7 @@ Other resource types remain `Unknown` and are included in email when cost exceed
 - Office 365 Outlook API connection authorized as `huliang@microsoft.com`
 - Azure Monitor metric alert for failed job executions and an independent email action group
 
-The Logic App callback is stored as an ACA secret. Reports use Entra ID authentication; no Storage account key is used. Weekly reports and failure alerts go to `coreairaifte@microsoft.com`; the existing Outlook sender authorization remains unchanged.
+The Logic App callback is stored as an ACA secret. Reports use Entra ID authentication; no Storage account key is used. Weekly reports and failure alerts go to `coreairaifte@microsoft.com`; the existing Outlook sender authorization remains `huliang@microsoft.com`.
 
 ## Files
 

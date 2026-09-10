@@ -22,8 +22,9 @@ The Office 365 connection uses delegated authorization. Its sender is the mailbo
 2. Rows at or below USD 100 are discarded.
 3. For supported resource types, Azure Monitor metrics are queried for the same period.
 4. A resource is an idle candidate only when every required usage metric has valid daily data on all 30 days in every returned time series, and all observed values are zero. Missing or invalid evidence never proves idle; explicit nonzero evidence proves activity. Each metric has an explicit aggregation, including ADX `QueryResult` with `Count`.
-5. JSON, CSV, and HTML artifacts are written to Blob Storage.
-6. The HTML summary lists idle candidates and unknown resources over USD 100 in separate sections, omitting active resources. The Logic App emails `coreairaifte@microsoft.com` and acknowledges the run only after its Outlook action succeeds.
+5. Supported idle and unknown resources are enriched with the latest nonzero Azure Monitor usage metric bucket over the previous 90 complete UTC days. A complete zero window is reported as `Not observed`, while missing evidence remains `Unavailable`.
+6. JSON, CSV, and HTML artifacts are written to Blob Storage.
+7. The HTML summary lists idle candidates and unknown resources over USD 100 in separate sections, omitting active resources. The Logic App emails `coreairaifte@microsoft.com` and acknowledges the run only after its Outlook action succeeds.
 
 ## Safety
 
@@ -32,16 +33,47 @@ The Office 365 connection uses delegated authorization. Its sender is the mailbo
 - Existing Owner rights on `raiuai` are not required by the application; a dedicated read-only identity should replace it after MVP validation.
 - The report labels recommendations as review candidates, not deletion decisions.
 
-## Supported MVP rules
+## Idle-safe rules
 
-- Event Hubs namespaces: incoming/outgoing messages and bytes
-- Virtual machines: CPU plus inbound/outbound network; any observed activity is active
-- Container registries: successful pushes and pulls
-- Azure AI Search: query and indexing activity
-- Azure Data Explorer: query and ingestion activity when those metrics are exposed
-- Container Instances: CPU and network activity
+These rules can classify a resource as an idle candidate only when every required metric has complete 30-day coverage and every observed value is zero.
 
-AKS, AML/Singularity, and unknown resource types are listed with cost but remain `Unknown` until a resource-specific rule is added.
+| Resource type | Required 30-day evidence | Signal type |
+|---|---|---|
+| Event Hubs namespace | Incoming/outgoing messages and bytes | Data plane |
+| Virtual machine | CPU and inbound/outbound network | Workload proxy |
+| Container registry | Successful push and pull counts | Data plane |
+| Azure AI Search | Query and indexing activity | Data plane |
+| Azure Data Explorer | Query results and ingestion volume/results | Data plane |
+| Container Instance group | Hourly CPU and inbound/outbound network | Workload proxy |
+
+## Activity-only rules for Unknown resources
+
+These rules never convert a resource to an idle candidate. They add a 90-day last-observed activity signal and likelihood to prioritize manual review while the classification remains `Unknown`.
+
+| Resource type | Activity signal | Signal type |
+|---|---|---|
+| Azure Cache for Redis | Commands processed | Data plane |
+| CDN profile | Request count | Data plane |
+| Cognitive Services account | Calls or transactions | Data plane |
+| Virtual machine scale set | CPU and network | Workload proxy |
+| Managed Grafana | HTTP request count | Data plane |
+| Data Factory | Pipeline run outcomes | Workload activity |
+| Cosmos DB account | Request count | Data plane |
+| Managed HSM | Service API calls | Data plane |
+| Azure Machine Learning workspace | Workspace runs | Workload activity |
+| Azure Firewall | Data processed | Data plane |
+| Service Bus namespace | Incoming and outgoing messages | Data plane |
+| Storage account | Transactions | Data plane |
+| App Service plan | Bytes received and sent | Workload proxy |
+
+Unknown likelihood is derived only from usable activity evidence:
+
+- `Low`: nonzero usage observed in the last 30 days.
+- `Medium`: last observed usage was 31-60 days ago, or older positive evidence has incomplete history coverage.
+- `High`: last observed usage was 61-90 days ago with complete coverage, or no nonzero usage was observed with complete 90-day coverage.
+- `Not assessed`: activity metrics are unavailable or coverage is insufficient.
+
+AKS, Singularity, and other types without either rule remain `Unknown / Not assessed`. A likelihood is review priority, not deletion approval.
 
 ## Operations and failure handling
 
